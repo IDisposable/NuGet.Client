@@ -11,7 +11,7 @@ namespace NuGet.Packaging.Core
         {
             if (string.IsNullOrEmpty(name))
             {
-                throw new ArgumentException(Strings.StringCannotBeNullOrEmpty, nameof(name));
+                throw new ArgumentException(PackagingCoreStrings.StringCannotBeNullOrEmpty, nameof(name));
             }
 
             if (version == null)
