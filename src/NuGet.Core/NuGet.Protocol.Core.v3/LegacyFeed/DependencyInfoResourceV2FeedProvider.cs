@@ -12,19 +12,18 @@ namespace NuGet.Protocol
         {
         }
 
-        public override Task<Tuple<bool, INuGetResource>> TryCreate(SourceRepository source, CancellationToken token)
+        public async override Task<Tuple<bool, INuGetResource>> TryCreate(SourceRepository source, CancellationToken token)
         {
             DependencyInfoResource resource = null;
 
             if ((FeedTypeUtility.GetFeedType(source.PackageSource) & FeedType.HttpV2) != FeedType.None)
             {
-                var httpSource = HttpSource.Create(source);
-                var parser = new V2FeedParser(httpSource, source.PackageSource);
+                var httpSourceResource = await source.GetResourceAsync<HttpSourceResource>(token);
 
-                resource = new DependencyInfoResourceV2Feed(parser, source);
+                resource = new DependencyInfoResourceV2Feed(httpSourceResource, source);
             }
 
-            return Task.FromResult(new Tuple<bool, INuGetResource>(resource != null, resource));
+            return new Tuple<bool, INuGetResource>(resource != null, resource);
         }
     }
 }

@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Xml;
 using System.Xml.Linq;
+using NuGet.Common;
 using NuGet.Configuration;
 using NuGet.Frameworks;
 using NuGet.Logging;
@@ -28,7 +29,7 @@ namespace NuGet.Protocol
         private const string W3Atom = "http://www.w3.org/2005/Atom";
         private const string MetadataNS = "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata";
         private const string DataServicesNS = "http://schemas.microsoft.com/ado/2007/08/dataservices";
-        private const string FindPackagesByIdFormat = "/FindPackagesById()?Id='{0}'";
+        private const string FindPackagesByIdFormat = "/FindPackagesById()?id='{0}'";
         private const string SearchEndPointFormat = "/Search()?$filter={0}&searchTerm='{1}'&targetFramework='{2}'&includePrerelease={3}&$skip={4}&$top={5}";
         private const string GetPackagesFormat = "/Packages(Id='{0}',Version='{1}')";
         private const string IsLatestVersionFilterFlag = "IsLatestVersion";
@@ -135,6 +136,7 @@ namespace NuGet.Protocol
             var packages = await QueryV2Feed(
                 uri,
                 package.Id,
+                cacheContext: null,
                 max: -1,
                 ignoreNotFounds: true,
                 log: log,
@@ -158,6 +160,7 @@ namespace NuGet.Protocol
         /// </summary>
         public async Task<IReadOnlyList<V2FeedPackageInfo>> FindPackagesByIdAsync(
             string id,
+            V2FeedCacheContext cacheContext,
             bool includeUnlisted,
             bool includePrerelease,
             ILogger log,
@@ -183,6 +186,7 @@ namespace NuGet.Protocol
             var packages = await QueryV2Feed(
                 uri,
                 id,
+                cacheContext,
                 max: -1,
                 ignoreNotFounds: false,
                 log: log,
@@ -199,7 +203,12 @@ namespace NuGet.Protocol
         /// </summary>
         public Task<IReadOnlyList<V2FeedPackageInfo>> FindPackagesByIdAsync(string id, ILogger log, CancellationToken token)
         {
-            return FindPackagesByIdAsync(id, includeUnlisted: true, includePrerelease: true, log: log, token: token);
+            return FindPackagesByIdAsync(id, null, includeUnlisted: true, includePrerelease: true, log: log, token: token);
+        }
+
+        public Task<IReadOnlyList<V2FeedPackageInfo>> FindPackagesByIdAsync(string id, ILogger log, string cacheKey, Func<int, HttpSourceCacheContext> CreateCacheContext, CancellationToken token)
+        {
+            return FindPackagesByIdAsync(id, new V2FeedCacheContext(cacheKey, CreateCacheContext), includeUnlisted: true, includePrerelease: true, log: log, token: token);
         }
 
         public async Task<IReadOnlyList<V2FeedPackageInfo>> Search(string searchTerm, SearchFilter filters, int skip, int take, ILogger log, CancellationToken cancellationToken)
@@ -219,6 +228,7 @@ namespace NuGet.Protocol
             return await QueryV2Feed(
                 uri,
                 id: null,
+                cacheContext: null,
                 max: take,
                 ignoreNotFounds: false,
                 log: log,
@@ -359,106 +369,119 @@ namespace NuGet.Protocol
         private async Task<List<V2FeedPackageInfo>> QueryV2Feed(
             string uri,
             string id,
+            V2FeedCacheContext cacheContext,
             int max,
             bool ignoreNotFounds,
             ILogger log,
             CancellationToken token)
         {
-            var results = new List<V2FeedPackageInfo>();
-            var page = 1;
-
-            // first request
-            Task<XDocument> docRequest = LoadXmlAsync(uri, ignoreNotFounds, log, token);
-
-            // TODO: re-implement caching at a higher level for both v2 and v3
-            while (!token.IsCancellationRequested && docRequest != null)
+            for (var retry = 0; retry < 3; ++retry)
             {
-                // TODO: Pages for a package Id are cached separately.
-                // So we will get inaccurate data when a page shrinks.
-                // However, (1) In most cases the pages grow rather than shrink;
-                // (2) cache for pages is valid for only 30 min.
-                // So we decide to leave current logic and observe.
-                string nextUri = null;
-                var doc = await docRequest;
-                if (doc != null)
+                try
                 {
-                    var result = ParsePage(doc, id);
-                    results.AddRange(result);
+                    var results = new List<V2FeedPackageInfo>();
+                    var page = 1;
 
-                    nextUri = GetNextUrl(doc);
-                }
+                    // first request
+                    var cacheKey = cacheContext != null ? string.Format(cacheContext.CacheKey, id, page) : null;
+                    Task<XDocument> docRequest = LoadXmlAsync(uri,
+                        cacheKey, cacheContext?.CreateCacheContext(retry), ignoreNotFounds, log, token);
 
-                docRequest = null;
-                if (max < 0 || results.Count < max)
-                {
-                    // Request the next url in parallel to parsing the current page
-                    if (!string.IsNullOrEmpty(nextUri) && uri != nextUri)
+                    // TODO: re-implement caching at a higher level for both v2 and v3
+                    while (!token.IsCancellationRequested && docRequest != null)
                     {
-                        // a bug on the server side causes the same next link to be returned 
-                        // for every page. To avoid falling into an infinite loop we must
-                        // keep track here.
-                        uri = nextUri;
+                        // TODO: Pages for a package Id are cached separately.
+                        // So we will get inaccurate data when a page shrinks.
+                        // However, (1) In most cases the pages grow rather than shrink;
+                        // (2) cache for pages is valid for only 30 min.
+                        // So we decide to leave current logic and observe.
+                        string nextUri = null;
+                        var doc = await docRequest;
+                        if (doc != null)
+                        {
+                            var result = ParsePage(doc, id);
+                            results.AddRange(result);
 
-                        docRequest = LoadXmlAsync(nextUri, ignoreNotFounds, log, token);
+                            nextUri = GetNextUrl(doc);
+                        }
+
+                        docRequest = null;
+                        if (max < 0 || results.Count < max)
+                        {
+                            // Request the next url in parallel to parsing the current page
+                            if (!string.IsNullOrEmpty(nextUri) && uri != nextUri)
+                            {
+                                // a bug on the server side causes the same next link to be returned 
+                                // for every page. To avoid falling into an infinite loop we must
+                                // keep track here.
+                                uri = nextUri;
+                                var key = cacheContext != null ? string.Format(cacheContext.CacheKey, id, page) : null;
+                                docRequest = LoadXmlAsync(nextUri, key, cacheContext?.CreateCacheContext(retry), ignoreNotFounds, log, token);
+                            }
+
+                            page++;
+                        }
                     }
 
-                    page++;
+                    if (max > -1 && results.Count > max)
+                    {
+                        // Remove extra results if the page contained extras
+                        results = results.Take(max).ToList();
+                    }
+
+                    return results;
+                }
+                catch (FatalProtocolException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (retry < 2)
+                {
+                    string message = string.Format(CultureInfo.CurrentCulture, Strings.Log_RetryingFindPackagesById, nameof(QueryV2Feed), uri)
+                        + Environment.NewLine
+                        + ExceptionUtilities.DisplayMessage(ex);
+                    log.LogMinimal(message);
+                }
+                catch (Exception ex) when (retry == 2)
+                {
+                    // Fail silently by returning empty result list
+                    var message = string.Format(CultureInfo.CurrentCulture, Strings.Log_FailedToRetrievePackage, uri);
+                    log.LogError(message + Environment.NewLine + ex.Message);
+
+                    throw new FatalProtocolException(message, ex);
                 }
             }
 
-            if (max > -1 && results.Count > max)
-            {
-                // Remove extra results if the page contained extras
-                results = results.Take(max).ToList();
-            }
-
-            return results;
+            return null;
         }
-        
+
         internal async Task<XDocument> LoadXmlAsync(
-            string uri,
-            bool ignoreNotFounds,
-            ILogger log,
-            CancellationToken token)
+           string uri,
+           string cacheKey,
+           HttpSourceCacheContext cacheContext,
+           bool ignoreNotFounds,
+           ILogger log,
+           CancellationToken token)
         {
-            return await _httpSource.ProcessResponseAsync(
-                () => 
-                {
-                    var request = new HttpRequestMessage(HttpMethod.Get, uri);
-                    request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/atom+xml"));
-                    request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/xml"));                    
-                    return request;
-                },
-                async response =>
-                {
-                    if (response.StatusCode == HttpStatusCode.OK)
-                    {
-                        var networkStream = await response.Content.ReadAsStreamAsync();
-                        var timeoutStream = new DownloadTimeoutStream(uri, networkStream, _httpSource.DownloadTimeout);
-                        return LoadXml(timeoutStream);
-                    }
-                    else if (ignoreNotFounds && response.StatusCode == HttpStatusCode.NotFound)
-                    {
-                        // Treat "404 Not Found" as an empty response.
-                        return null;
-                    }
-                    else if (response.StatusCode == HttpStatusCode.NoContent)
-                    {
-                        // Always treat "204 No Content" as exactly that.
-                        return null;
-                    }
-                    else
-                    {
-                        throw new FatalProtocolException(string.Format(
-                            CultureInfo.CurrentCulture,
-                            Strings.Log_FailedToFetchV2Feed,
+            using (var data = await _httpSource.GetAsync(
                             uri,
-                            (int)response.StatusCode,
-                            response.ReasonPhrase));
-                    }
-                },
-                log,
-                token);
+                            new[] { new MediaTypeWithQualityHeaderValue("application/atom+xml"), new MediaTypeWithQualityHeaderValue("application/xml") },
+                            cacheKey,
+                            cacheContext,
+                            log,
+                            ignoreNotFounds: ignoreNotFounds,
+                            ensureValidContents: stream => HttpStreamValidation.ValidateXml(uri, stream),
+                            cancellationToken: token))
+            {
+                if (data?.Stream != null)
+                {
+                    return LoadXml(data.Stream);
+                }
+                else
+                {
+                    return null;
+                }
+            }
         }
 
         internal static string GetNextUrl(XDocument doc)
@@ -485,6 +508,19 @@ namespace NuGet.Protocol
             });
 
             return XDocument.Load(xmlReader, LoadOptions.None);
+        }
+
+        public class V2FeedCacheContext
+        {
+            public string CacheKey { get; }
+
+            public Func<int, HttpSourceCacheContext> CreateCacheContext { get; }
+
+            public V2FeedCacheContext(string cachekey, Func<int, HttpSourceCacheContext> createCacheContext)
+            {
+                CacheKey = cachekey;
+                CreateCacheContext = createCacheContext;
+            }
         }
     }
 }
