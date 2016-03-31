@@ -40,18 +40,8 @@ namespace NuGet.Protocol
         // Only one thread may re-create the http client at a time.
         private readonly SemaphoreSlim _httpClientLock = new SemaphoreSlim(1, 1);
 
-        // In order to avoid too many open files error, set concurrent requests number to 16 on Mac
-        private readonly static int ConcurrencyLimit = 16;
-
         // Only one source may prompt at a time
         private readonly static SemaphoreSlim _credentialPromptLock = new SemaphoreSlim(1, 1);
-
-        // Limiting concurrent requests to limit the amount of files open at a time on Mac OSX
-        // the default is 256 which is easy to hit if we don't limit concurrency
-        private readonly static SemaphoreSlim _throttle =
-            RuntimeEnvironmentHelper.IsMacOSX
-                ? new SemaphoreSlim(ConcurrencyLimit, ConcurrencyLimit)
-                : null;
 
         public TimeSpan DownloadTimeout { get; set; } = DefaultDownloadTimeout;
 
@@ -189,12 +179,12 @@ namespace NuGet.Protocol
             };
 
             // Read the response headers before reading the entire stream to avoid timeouts from large packages.
-            Func<Task<HttpResponseMessage>> throttleRequest = () => SendWithCredentialSupportAsync(
+            Func<Task<HttpResponseMessage>> HttpRequest = () => SendWithCredentialSupportAsync(
                     requestFactory,
                     log,
                     cancellationToken);
 
-            var response = await GetThrottled(throttleRequest);
+            var response = await HttpRequest();
 
             try
             {
@@ -261,8 +251,6 @@ namespace NuGet.Protocol
 
         }
 
-
-
         public async Task<T> ProcessStreamAsync<T>(
             Uri uri,
             bool ignoreNotFounds,
@@ -287,12 +275,12 @@ namespace NuGet.Protocol
             ILogger log,
             CancellationToken token)
         {
-            Func<Task<HttpResponseMessage>> throttledRequest = () => SendWithCredentialSupportAsync(
+            Func<Task<HttpResponseMessage>> request = () => SendWithCredentialSupportAsync(
                     requestFactory,
                     log,
                     token);
 
-            using (var response = await GetThrottled(throttledRequest))
+            using (var response = await request())
             {
                 return await processAsync(response);
             }
@@ -318,27 +306,6 @@ namespace NuGet.Protocol
                 },
                 log: log,
                 token: token);
-        }
-
-        private static async Task<HttpResponseMessage> GetThrottled(Func<Task<HttpResponseMessage>> request)
-        {
-            if (_throttle == null)
-            {
-                return await request();
-            }
-            else
-            {
-                try
-                {
-                    await _throttle.WaitAsync();
-
-                    return await request();
-                }
-                finally
-                {
-                    _throttle.Release();
-                }
-            }
         }
 
         private async Task<HttpResponseMessage> SendWithCredentialSupportAsync(
